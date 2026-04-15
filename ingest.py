@@ -68,7 +68,7 @@ def manual_ingest():
     
     # Batch processing for progress bar
     batch_size = 5
-    total_batches = (len(docs) + batch_size - 1) // batch_size # 11 + 5 - 1 = 15 // 5 = 3 batches
+    total_batches = (len(docs) + batch_size - 1) // batch_size
     
     if os.path.exists(rag_engine.FAISS_INDEX_PATH):
         try:
@@ -88,7 +88,7 @@ def manual_ingest():
         if db is None:
             db = FAISS.from_documents(batch, embeddings)
         else:
-            db.add_documents(batch) # 11 -> 5 -> 5 -> 1
+            db.add_documents(batch)
             
     print("Saving Vector Index...")
     db.save_local(rag_engine.FAISS_INDEX_PATH)
@@ -103,7 +103,7 @@ def manual_ingest():
         except Exception as e:
             print(f"Failed to move {f}: {e}")
 
-    print("\n Ingestion Complete! You can now run the main app.")
+    print("\n✅ Ingestion Complete! You can now run the main app.")
 
 if __name__ == "__main__":
     manual_ingest()

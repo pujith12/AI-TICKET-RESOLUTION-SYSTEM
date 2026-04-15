@@ -1,10 +1,14 @@
 import os
 import shutil
 import logging
+import re
 import ollama
+from typing import Dict, List
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+import config
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +31,36 @@ from langchain_core.embeddings import Embeddings
 
 # Disable httpx logs
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i", "in",
+    "is", "it", "of", "on", "or", "that", "the", "to", "was", "with", "you",
+    "your",
+}
+
+
+def _tokenize(text: str) -> List[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if token not in STOP_WORDS and len(token) > 2
+    ]
+
+
+def _distance_to_similarity(distance: float) -> float:
+    """
+    Converts FAISS L2 distance to a bounded 0..1 similarity score.
+    """
+    normalizer = max(config.get_float_env("RAG_DISTANCE_NORMALIZER", 2500.0), 1.0)
+    return max(0.0, min(1.0, 1.0 / (1.0 + (float(distance) / normalizer))))
+
+
+def _keyword_overlap_score(query_tokens: List[str], content_tokens: List[str]) -> float:
+    if not query_tokens:
+        return 0.0
+    overlap = len(set(query_tokens) & set(content_tokens))
+    return overlap / len(set(query_tokens))
+
 
 class OllamaEmbeddings(Embeddings):
     """Custom Embeddings class to use Ollama natively."""
@@ -120,20 +154,67 @@ def ingest_documents():
 
 def get_relevant_context(query, k=2):
     """
-    Retrieves the most relevant context chunks for a given query.
-    k=2 for efficiency and speed.
+    Retrieves the most relevant context chunks and similarity metadata.
     """
     if not os.path.exists(FAISS_INDEX_PATH):
-        return ""
+        return {
+            "context_text": "",
+            "kb_context_found": False,
+            "retrieval_score": 0.0,
+            "matches": [],
+        }
 
     embeddings = OllamaEmbeddings(model="tinyllama")
     try:
         db = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-        docs = db.similarity_search(query, k=k)
-        return "\n\n".join([d.page_content for d in docs])
+        docs_with_scores = db.similarity_search_with_score(query, k=k)
+        query_tokens = _tokenize(query)
+
+        matches: List[Dict[str, object]] = []
+        for doc, distance in docs_with_scores:
+            content_tokens = _tokenize(doc.page_content)
+            distance_similarity = _distance_to_similarity(distance)
+            keyword_overlap = _keyword_overlap_score(query_tokens, content_tokens)
+            similarity_score = (0.55 * distance_similarity) + (0.45 * keyword_overlap)
+            matches.append(
+                {
+                    "content": doc.page_content,
+                    "metadata": doc.metadata,
+                    "distance": float(distance),
+                    "distance_similarity": round(distance_similarity, 4),
+                    "keyword_overlap_score": round(keyword_overlap, 4),
+                    "similarity_score": round(similarity_score, 4),
+                }
+            )
+
+        context_text = "\n\n".join(match["content"] for match in matches)
+        top_retrieval_score = (
+            max(match["similarity_score"] for match in matches)
+            if matches
+            else 0.0
+        )
+        retrieval_score = (
+            sum(match["similarity_score"] for match in matches) / len(matches)
+            if matches
+            else 0.0
+        )
+        context_min_score = config.get_float_env("RAG_CONTEXT_MIN_SCORE", 0.2)
+        return {
+            "context_text": context_text,
+            "kb_context_found": top_retrieval_score >= context_min_score,
+            "retrieval_score": round(retrieval_score, 3),
+            "top_retrieval_score": round(top_retrieval_score, 3),
+            "matches": matches,
+        }
     except Exception as e:
         logging.error(f"Error retrieving context: {e}")
-        return ""
+        return {
+            "context_text": "",
+            "kb_context_found": False,
+            "retrieval_score": 0.0,
+            "matches": [],
+            "error": str(e),
+        }
 
 if __name__ == "__main__":
     ingest_documents()
